@@ -26,6 +26,11 @@ from torch._inductor import config, scheduler
 from torch._inductor.codegen.triton_utils import signature_to_meta
 from torch._inductor.utils import DeferredLineBase, sympy_symbol, unique
 
+from torch._inductor.debug import create_fx_from_fxnodes
+from torch.fx.graph_module import GraphModule
+from torch._dynamo.repro.after_aot import save_graph_repro
+from torch._dynamo.testing import rand_strided
+
 
 pexpr = PythonPrinter().doprint
 
@@ -425,7 +430,7 @@ class XPUTritonScheduling(TritonScheduling):
     def __init__(self, scheduler):
         super().__init__(scheduler)
 
-    def codegen_node_schedule(self, node_schedule, numel, reduction_numel):
+    def codegen_node_schedule(self, node_schedule, numel, reduction_numel, gm): # add gm
         tiled_groups = self.select_tiling(node_schedule, numel, reduction_numel)
         reduction_hint_val, mutations, index_dtype = self.get_kernel_args(
             node_schedule, numel, reduction_numel
@@ -439,9 +444,25 @@ class XPUTritonScheduling(TritonScheduling):
         )
 
         self.codegen_node_schedule_with_kernel(node_schedule, kernel)
+        snodes = list()
+        for node in node_schedule:
+            if isinstance(node, torch._inductor.scheduler.SchedulerNode):
+                snodes.append(node)
+        
+        example_inputs = []
+        graph, graph_old, placeholdernode= create_fx_from_fxnodes(snodes)
+        for node in placeholdernode:
+            example_inputs.append(node.meta['val'])
 
+        gm_kernel = GraphModule(torch.nn.Module(), graph)
+        # arg0_1 = torch.zeros((24,2048,2048), device='xpu:0', dtype=torch.bfloat16)
+        
         src_code = kernel.codegen_kernel()
         kernel_name = self.define_kernel(src_code, node_schedule)
+    
+        with open(f"{kernel_name}.py",'w') as fd:
+            save_graph_repro(fd, gm_kernel, example_inputs, "inductor")
+
         self.codegen_comment(node_schedule)
         kernel.call_kernel(kernel_name)
 
